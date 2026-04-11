@@ -1,0 +1,93 @@
+name: 🌍 Update FIDE Database
+
+on:
+  # Mise à jour automatique le 5 de chaque mois à 6h UTC
+  schedule:
+    - cron: '0 6 5 * *'
+
+  # Déclenchement manuel depuis GitHub
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Forcer la mise à jour même si récente'
+        required: false
+        default: 'false'
+
+jobs:
+  update-fide-db:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Nécessaire pour créer des releases
+
+    steps:
+      - name: 📥 Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Installation dépendances Python
+        run: pip install lxml requests tqdm
+
+      - name: ⚙️ Traitement base FIDE
+        id: process
+        run: |
+          python scripts/process_fide.py
+          echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+          echo "count=$(python3 -c "
+          import sqlite3
+          conn = sqlite3.connect('fide_players.db')
+          n = conn.execute('SELECT COUNT(*) FROM players').fetchone()[0]
+          conn.close()
+          print(f'{n:,}')
+          ")" >> $GITHUB_OUTPUT
+
+      - name: 📊 Résumé
+        run: |
+          echo "✅ Base FIDE traitée"
+          echo "   Date  : ${{ steps.process.outputs.date }}"
+          echo "   Joueurs : ${{ steps.process.outputs.count }}"
+          ls -lh fide_players.db.gz
+
+      - name: 🗑️ Suppression ancienne release fide-latest
+        run: gh release delete fide-latest --yes 2>/dev/null || echo "Aucune release existante"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🗑️ Suppression ancien tag fide-latest
+        run: |
+          git push --delete origin fide-latest 2>/dev/null || echo "Aucun tag existant"
+
+      - name: 🚀 Création release fide-latest
+        run: |
+          gh release create fide-latest \
+            --title "🌍 FIDE Database — ${{ steps.process.outputs.date }}" \
+            --notes "$(cat <<'EOF'
+          ## Base de données FIDE mondiale
+
+          | Champ | Valeur |
+          |-------|--------|
+          | 📅 Date | ${{ steps.process.outputs.date }} |
+          | 👥 Joueurs | ${{ steps.process.outputs.count }} |
+          | 📊 Source | [ratings.fide.com](https://ratings.fide.com) |
+          | 🔄 Mise à jour | Automatique le 5 de chaque mois |
+
+          ## Contenu de fide_players.db.gz
+          - SQLite compressé gzip
+          - Champs : fide_id, name, fed, sex, title, elo, rapid, blitz, birth
+          - Index sur : name, fed, fide_id
+
+          ## Utilisation dans l'app Electron
+          Téléchargement automatique via le bouton 🔄 Màj dans l'interface.
+          EOF
+          )" \
+            fide_players.db.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ✅ Notification succès
+        run: |
+          echo "🎉 Release fide-latest créée avec succès !"
+          echo "URL: https://github.com/${{ github.repository }}/releases/tag/fide-latest"
