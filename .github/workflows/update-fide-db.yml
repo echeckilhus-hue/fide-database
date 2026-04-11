@@ -1,93 +1,228 @@
-name: 🌍 Update FIDE Database
+name: Update FIDE Database
 
 on:
-  # Mise à jour automatique le 5 de chaque mois à 6h UTC
   schedule:
-    - cron: '0 6 5 * *'
-
-  # Déclenchement manuel depuis GitHub
+    # Premier jour de chaque mois à 3h UTC
+    - cron: '0 3 1 * *'
   workflow_dispatch:
-    inputs:
-      force_update:
-        description: 'Forcer la mise à jour même si récente'
-        required: false
-        default: 'false'
+
+permissions:
+  contents: write   # ← OBLIGATOIRE pour créer des releases
 
 jobs:
   update-fide-db:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # Nécessaire pour créer des releases
-
     steps:
-      - name: 📥 Checkout du repo
+      # ─────────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────────
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python 3.11
+      # ─────────────────────────────────────────────
+      # 2. Python + dépendances
+      # ─────────────────────────────────────────────
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Installation dépendances Python
-        run: pip install lxml requests tqdm
+      - name: Install dependencies
+        run: pip install requests
 
-      - name: ⚙️ Traitement base FIDE
-        id: process
+      # ─────────────────────────────────────────────
+      # 3. Télécharger + construire la base SQLite
+      # ─────────────────────────────────────────────
+      - name: Build FIDE SQLite database
         run: |
-          python scripts/process_fide.py
-          echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-          echo "count=$(python3 -c "
-          import sqlite3
-          conn = sqlite3.connect('fide_players.db')
-          n = conn.execute('SELECT COUNT(*) FROM players').fetchone()[0]
-          conn.close()
-          print(f'{n:,}')
-          ")" >> $GITHUB_OUTPUT
+          python3 - <<'PYEOF'
+          import requests, sqlite3, os, io, zipfile, csv, gzip, datetime
 
-      - name: 📊 Résumé
+          FIDE_URL = "https://ratings.fide.com/download/players_list.zip"
+          print(f"[FIDE] Téléchargement depuis {FIDE_URL} ...")
+
+          r = requests.get(FIDE_URL, timeout=120, stream=True)
+          r.raise_for_status()
+
+          total = int(r.headers.get('content-length', 0))
+          data  = bytearray()
+          downloaded = 0
+          for chunk in r.iter_content(chunk_size=65536):
+              data.extend(chunk)
+              downloaded += len(chunk)
+              if total:
+                  pct = downloaded * 100 // total
+                  if downloaded % (5 * 1024 * 1024) < 65536:
+                      print(f"  {pct}% ({downloaded // 1024 // 1024} MB)")
+
+          print("[FIDE] Extraction ZIP ...")
+          with zipfile.ZipFile(io.BytesIO(bytes(data))) as z:
+              name = z.namelist()[0]
+              print(f"  Fichier dans le ZIP: {name}")
+              raw = z.read(name)
+
+          print("[FIDE] Construction SQLite ...")
+          db = sqlite3.connect('fide_players.db')
+          db.execute('PRAGMA journal_mode=WAL')
+          db.execute('PRAGMA synchronous=NORMAL')
+          db.execute('''CREATE TABLE IF NOT EXISTS players (
+              fide_id  INTEGER PRIMARY KEY,
+              name     TEXT,
+              fed      TEXT,
+              sex      TEXT,
+              title    TEXT,
+              elo      INTEGER,
+              rapid    INTEGER,
+              blitz    INTEGER,
+              birth    TEXT,
+              flag     TEXT
+          )''')
+          db.execute('CREATE INDEX IF NOT EXISTS idx_name ON players(name)')
+          db.execute('CREATE INDEX IF NOT EXISTS idx_fed  ON players(fed)')
+          db.execute('CREATE INDEX IF NOT EXISTS idx_elo  ON players(elo)')
+
+          lines  = raw.decode('utf-8', errors='replace').splitlines()
+          reader = csv.DictReader(lines, delimiter='\t')
+
+          batch      = []
+          total_rows = 0
+          rated_rows = 0
+          BATCH_SIZE = 5000
+
+          def get(row, *keys):
+              for k in keys:
+                  v = row.get(k, row.get(k.lower(), row.get(k.upper(), ''))).strip()
+                  if v: return v
+              return ''
+
+          for row in reader:
+              fide_id = get(row, 'ID_NUMBER', 'id_number', 'Fideid', 'fide_id')
+              name    = get(row, 'NAME', 'name', 'Name')
+              fed     = get(row, 'FED', 'fed', 'Country')
+              sex     = get(row, 'SEX', 'sex', 'Sex')
+              title   = get(row, 'TITU', 'titu', 'Title', 'title')
+              elo     = int(get(row, 'RTNG', 'rtng', 'rating', 'Rtng') or '0')
+              rapid   = int(get(row, 'RRTNG', 'rrtng', 'RapidRtng') or '0')
+              blitz   = int(get(row, 'BRTNG', 'brtng', 'BlitzRtng') or '0')
+              birth   = get(row, 'B_YEAR', 'b_year', 'Byear')
+              flag    = get(row, 'FLAG', 'flag', 'Flag')
+              if not fide_id: continue
+              batch.append((int(fide_id), name, fed, sex, title, elo, rapid, blitz, birth, flag))
+              total_rows += 1
+              if elo > 0: rated_rows += 1
+              if len(batch) >= BATCH_SIZE:
+                  db.executemany('INSERT OR REPLACE INTO players VALUES(?,?,?,?,?,?,?,?,?,?)', batch)
+                  db.commit()
+                  batch = []
+                  if total_rows % 100000 == 0:
+                      print(f"  {total_rows:,} joueurs insérés...")
+
+          if batch:
+              db.executemany('INSERT OR REPLACE INTO players VALUES(?,?,?,?,?,?,?,?,?,?)', batch)
+              db.commit()
+
+          db.execute('ANALYZE')
+          db.close()
+
+          size_mb = os.path.getsize('fide_players.db') / 1024 / 1024
+
+          print(f"\n[FIDE] ✅ Base créée:")
+          print(f"  Joueurs total   : {total_rows:,}")
+          print(f"  Joueurs classés : {rated_rows:,}")
+          print(f"  Taille          : {size_mb:.1f} MB")
+
+          # Écrire les stats pour la suite
+          with open('fide_stats.txt', 'w') as f:
+              f.write(f"{total_rows}\n{rated_rows}\n{datetime.date.today().isoformat()}\n")
+          PYEOF
+
+      # ─────────────────────────────────────────────
+      # 4. Compresser en .gz
+      # ─────────────────────────────────────────────
+      - name: Compress database
         run: |
-          echo "✅ Base FIDE traitée"
-          echo "   Date  : ${{ steps.process.outputs.date }}"
-          echo "   Joueurs : ${{ steps.process.outputs.count }}"
-          ls -lh fide_players.db.gz
+          gzip -9 -k fide_players.db
+          mv fide_players.db.gz fide_players_compressed.db.gz
+          ls -lh fide_players*.db* fide_players*.gz 2>/dev/null || true
+          # Renommer proprement
+          mv fide_players_compressed.db.gz fide_players.db.gz
+          SIZE=$(du -sh fide_players.db.gz | cut -f1)
+          echo "Taille compressée : $SIZE"
 
-      - name: 🗑️ Suppression ancienne release fide-latest
-        run: gh release delete fide-latest --yes 2>/dev/null || echo "Aucune release existante"
+      # ─────────────────────────────────────────────
+      # 5. Lire les stats
+      # ─────────────────────────────────────────────
+      - name: Read stats
+        id: stats
+        run: |
+          TOTAL=$(sed -n '1p' fide_stats.txt)
+          RATED=$(sed -n '2p' fide_stats.txt)
+          DATE=$(sed -n '3p' fide_stats.txt)
+          SIZE=$(du -sh fide_players.db.gz | cut -f1)
+          echo "total=$TOTAL"   >> $GITHUB_OUTPUT
+          echo "rated=$RATED"   >> $GITHUB_OUTPUT
+          echo "date=$DATE"     >> $GITHUB_OUTPUT
+          echo "size=$SIZE"     >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────────
+      # 6. Supprimer l'ancienne release fide-latest
+      #    (si elle existe) puis créer la nouvelle
+      # ─────────────────────────────────────────────
+      - name: Delete existing release (if any)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🗑️ Suppression ancien tag fide-latest
         run: |
-          git push --delete origin fide-latest 2>/dev/null || echo "Aucun tag existant"
+          # Supprimer la release existante (ignore l'erreur si absente)
+          RELEASE_ID=$(gh release view fide-latest --json id -q '.id' 2>/dev/null || echo "")
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Suppression release existante (ID: $RELEASE_ID)"
+            gh release delete fide-latest --yes --cleanup-tag 2>/dev/null || true
+            sleep 3
+          else
+            echo "Aucune release existante à supprimer"
+          fi
 
-      - name: 🚀 Création release fide-latest
+      - name: Create release and upload asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          DATE="${{ steps.stats.outputs.date }}"
+          TOTAL="${{ steps.stats.outputs.total }}"
+          RATED="${{ steps.stats.outputs.rated }}"
+          SIZE="${{ steps.stats.outputs.size }}"
+
           gh release create fide-latest \
-            --title "🌍 FIDE Database — ${{ steps.process.outputs.date }}" \
-            --notes "$(cat <<'EOF'
-          ## Base de données FIDE mondiale
+            --title "FIDE Database — ${DATE}" \
+            --notes "## 🌍 Base de données FIDE — ${DATE}
 
           | Champ | Valeur |
-          |-------|--------|
-          | 📅 Date | ${{ steps.process.outputs.date }} |
-          | 👥 Joueurs | ${{ steps.process.outputs.count }} |
-          | 📊 Source | [ratings.fide.com](https://ratings.fide.com) |
-          | 🔄 Mise à jour | Automatique le 5 de chaque mois |
+          |---|---|
+          | 👥 Joueurs total | $(echo $TOTAL | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta') |
+          | 📊 Joueurs classés | $(echo $RATED | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta') |
+          | 📦 Taille compressée | ${SIZE} |
+          | 📅 Date | ${DATE} |
 
-          ## Contenu de fide_players.db.gz
-          - SQLite compressé gzip
-          - Champs : fide_id, name, fed, sex, title, elo, rapid, blitz, birth
-          - Index sur : name, fed, fide_id
+          ### Installation
+          Le fichier est téléchargé automatiquement par Gestion Échecs.
+          Cliquez sur **Mode Mondial** puis **Télécharger la base FIDE**." \
+            --latest \
+            "fide_players.db.gz"
 
-          ## Utilisation dans l'app Electron
-          Téléchargement automatique via le bouton 🔄 Màj dans l'interface.
-          EOF
-          )" \
-            fide_players.db.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "✅ Release créée avec succès !"
+          echo "URL: https://github.com/${{ github.repository }}/releases/download/fide-latest/fide_players.db.gz"
 
-      - name: ✅ Notification succès
+      # ─────────────────────────────────────────────
+      # 7. Résumé dans le job
+      # ─────────────────────────────────────────────
+      - name: Job summary
         run: |
-          echo "🎉 Release fide-latest créée avec succès !"
-          echo "URL: https://github.com/${{ github.repository }}/releases/tag/fide-latest"
+          echo "## 🌍 FIDE Database — ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Champ | Valeur |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 👥 Joueurs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📊 Joueurs classés | ${{ steps.stats.outputs.rated }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Taille compressée | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Release créée :** \`fide-latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **URL :** https://github.com/${{ github.repository }}/releases/download/fide-latest/fide_players.db.gz" >> $GITHUB_STEP_SUMMARY
