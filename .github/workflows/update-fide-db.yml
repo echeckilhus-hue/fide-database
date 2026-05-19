@@ -131,6 +131,13 @@ jobs:
           print(f"  Joueurs classés : {rated_rows:,}")
           print(f"  Taille          : {size_mb:.1f} MB")
 
+          # ✅ GARDE : refuser une base vide ou trop petite (URL FIDE invalide, format changé…)
+          if total_rows < 500_000:
+              raise RuntimeError(
+                  f"Téléchargement FIDE suspect : seulement {total_rows} joueurs "
+                  f"(attendu > 500 000). URL invalide ou format modifié. Job annulé."
+              )
+
           # Écrire les stats pour la suite
           with open('fide_stats.txt', 'w') as f:
               f.write(f"{total_rows}\n{rated_rows}\n{datetime.date.today().isoformat()}\n")
