@@ -13,15 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
 
       - name: Build FIDE SQLite database
-        run: python3 process_fide.py
+        run: python3 scripts/process_fide.py
 
       - name: Validate database
         run: |
