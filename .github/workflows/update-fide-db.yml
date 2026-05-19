@@ -2,163 +2,60 @@ name: Update FIDE Database
 
 on:
   schedule:
-    # Premier jour de chaque mois à 3h UTC
     - cron: '0 3 1 * *'
   workflow_dispatch:
 
 permissions:
-  contents: write   # ← OBLIGATOIRE pour créer des releases
+  contents: write
 
 jobs:
   update-fide-db:
     runs-on: ubuntu-latest
     steps:
-      # ─────────────────────────────────────────────
-      # 1. Checkout
-      # ─────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────────
-      # 2. Python + dépendances
-      # ─────────────────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
-
-      # ─────────────────────────────────────────────
-      # 3. Télécharger + construire la base SQLite
-      # ─────────────────────────────────────────────
       - name: Build FIDE SQLite database
+        run: python3 process_fide.py
+
+      - name: Validate database
         run: |
           python3 - <<'PYEOF'
-          import requests, sqlite3, os, io, zipfile, csv, gzip, datetime
+          import sqlite3, os, sys, datetime
 
-          FIDE_URL = "https://ratings.fide.com/download/players_list.zip"
-          print(f"[FIDE] Téléchargement depuis {FIDE_URL} ...")
+          DB = 'fide_players.db'
+          GZ = 'fide_players.db.gz'
 
-          r = requests.get(FIDE_URL, timeout=120, stream=True)
-          r.raise_for_status()
+          if not os.path.exists(DB):
+              print(f"ERREUR: {DB} introuvable"); sys.exit(1)
+          if not os.path.exists(GZ):
+              print(f"ERREUR: {GZ} introuvable"); sys.exit(1)
 
-          total = int(r.headers.get('content-length', 0))
-          data  = bytearray()
-          downloaded = 0
-          for chunk in r.iter_content(chunk_size=65536):
-              data.extend(chunk)
-              downloaded += len(chunk)
-              if total:
-                  pct = downloaded * 100 // total
-                  if downloaded % (5 * 1024 * 1024) < 65536:
-                      print(f"  {pct}% ({downloaded // 1024 // 1024} MB)")
+          conn = sqlite3.connect(DB)
+          total = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+          rated = conn.execute("SELECT COUNT(*) FROM players WHERE elo > 0").fetchone()[0]
+          conn.close()
 
-          print("[FIDE] Extraction ZIP ...")
-          with zipfile.ZipFile(io.BytesIO(bytes(data))) as z:
-              name = z.namelist()[0]
-              print(f"  Fichier dans le ZIP: {name}")
-              raw = z.read(name)
+          size_gz = os.path.getsize(GZ)
+          print(f"  Joueurs total   : {total:,}")
+          print(f"  Joueurs classes : {rated:,}")
+          print(f"  Taille gz       : {size_gz / 1024 / 1024:.1f} MB")
 
-          print("[FIDE] Construction SQLite ...")
-          db = sqlite3.connect('fide_players.db')
-          db.execute('PRAGMA journal_mode=WAL')
-          db.execute('PRAGMA synchronous=NORMAL')
-          db.execute('''CREATE TABLE IF NOT EXISTS players (
-              fide_id  INTEGER PRIMARY KEY,
-              name     TEXT,
-              fed      TEXT,
-              sex      TEXT,
-              title    TEXT,
-              elo      INTEGER,
-              rapid    INTEGER,
-              blitz    INTEGER,
-              birth    TEXT,
-              flag     TEXT
-          )''')
-          db.execute('CREATE INDEX IF NOT EXISTS idx_name ON players(name)')
-          db.execute('CREATE INDEX IF NOT EXISTS idx_fed  ON players(fed)')
-          db.execute('CREATE INDEX IF NOT EXISTS idx_elo  ON players(elo)')
+          if total < 500_000:
+              print(f"ERREUR: Base suspecte ({total} joueurs, attendu > 500 000)"); sys.exit(1)
+          if size_gz < 5_000_000:
+              print(f"ERREUR: Fichier gz trop petit ({size_gz} octets)"); sys.exit(1)
 
-          lines  = raw.decode('utf-8', errors='replace').splitlines()
-          reader = csv.DictReader(lines, delimiter='\t')
-
-          batch      = []
-          total_rows = 0
-          rated_rows = 0
-          BATCH_SIZE = 5000
-
-          def get(row, *keys):
-              for k in keys:
-                  v = row.get(k, row.get(k.lower(), row.get(k.upper(), ''))).strip()
-                  if v: return v
-              return ''
-
-          for row in reader:
-              fide_id = get(row, 'ID_NUMBER', 'id_number', 'Fideid', 'fide_id')
-              name    = get(row, 'NAME', 'name', 'Name')
-              fed     = get(row, 'FED', 'fed', 'Country')
-              sex     = get(row, 'SEX', 'sex', 'Sex')
-              title   = get(row, 'TITU', 'titu', 'Title', 'title')
-              elo     = int(get(row, 'RTNG', 'rtng', 'rating', 'Rtng') or '0')
-              rapid   = int(get(row, 'RRTNG', 'rrtng', 'RapidRtng') or '0')
-              blitz   = int(get(row, 'BRTNG', 'brtng', 'BlitzRtng') or '0')
-              birth   = get(row, 'B_YEAR', 'b_year', 'Byear')
-              flag    = get(row, 'FLAG', 'flag', 'Flag')
-              if not fide_id: continue
-              batch.append((int(fide_id), name, fed, sex, title, elo, rapid, blitz, birth, flag))
-              total_rows += 1
-              if elo > 0: rated_rows += 1
-              if len(batch) >= BATCH_SIZE:
-                  db.executemany('INSERT OR REPLACE INTO players VALUES(?,?,?,?,?,?,?,?,?,?)', batch)
-                  db.commit()
-                  batch = []
-                  if total_rows % 100000 == 0:
-                      print(f"  {total_rows:,} joueurs insérés...")
-
-          if batch:
-              db.executemany('INSERT OR REPLACE INTO players VALUES(?,?,?,?,?,?,?,?,?,?)', batch)
-              db.commit()
-
-          db.execute('ANALYZE')
-          db.close()
-
-          size_mb = os.path.getsize('fide_players.db') / 1024 / 1024
-
-          print(f"\n[FIDE] ✅ Base créée:")
-          print(f"  Joueurs total   : {total_rows:,}")
-          print(f"  Joueurs classés : {rated_rows:,}")
-          print(f"  Taille          : {size_mb:.1f} MB")
-
-          # ✅ GARDE : refuser une base vide ou trop petite (URL FIDE invalide, format changé…)
-          if total_rows < 500_000:
-              raise RuntimeError(
-                  f"Téléchargement FIDE suspect : seulement {total_rows} joueurs "
-                  f"(attendu > 500 000). URL invalide ou format modifié. Job annulé."
-              )
-
-          # Écrire les stats pour la suite
           with open('fide_stats.txt', 'w') as f:
-              f.write(f"{total_rows}\n{rated_rows}\n{datetime.date.today().isoformat()}\n")
+              f.write(f"{total}\n{rated}\n{datetime.date.today().isoformat()}\n")
+          print("Validation reussie")
           PYEOF
 
-      # ─────────────────────────────────────────────
-      # 4. Compresser en .gz
-      # ─────────────────────────────────────────────
-      - name: Compress database
-        run: |
-          gzip -9 -k fide_players.db
-          mv fide_players.db.gz fide_players_compressed.db.gz
-          ls -lh fide_players*.db* fide_players*.gz 2>/dev/null || true
-          # Renommer proprement
-          mv fide_players_compressed.db.gz fide_players.db.gz
-          SIZE=$(du -sh fide_players.db.gz | cut -f1)
-          echo "Taille compressée : $SIZE"
-
-      # ─────────────────────────────────────────────
-      # 5. Lire les stats
-      # ─────────────────────────────────────────────
       - name: Read stats
         id: stats
         run: |
@@ -166,27 +63,19 @@ jobs:
           RATED=$(sed -n '2p' fide_stats.txt)
           DATE=$(sed -n '3p' fide_stats.txt)
           SIZE=$(du -sh fide_players.db.gz | cut -f1)
-          echo "total=$TOTAL"   >> $GITHUB_OUTPUT
-          echo "rated=$RATED"   >> $GITHUB_OUTPUT
-          echo "date=$DATE"     >> $GITHUB_OUTPUT
-          echo "size=$SIZE"     >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "rated=$RATED" >> $GITHUB_OUTPUT
+          echo "date=$DATE"   >> $GITHUB_OUTPUT
+          echo "size=$SIZE"   >> $GITHUB_OUTPUT
 
-      # ─────────────────────────────────────────────
-      # 6. Supprimer l'ancienne release fide-latest
-      #    (si elle existe) puis créer la nouvelle
-      # ─────────────────────────────────────────────
       - name: Delete existing release (if any)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Supprimer la release existante (ignore l'erreur si absente)
           RELEASE_ID=$(gh release view fide-latest --json id -q '.id' 2>/dev/null || echo "")
           if [ -n "$RELEASE_ID" ]; then
-            echo "Suppression release existante (ID: $RELEASE_ID)"
             gh release delete fide-latest --yes --cleanup-tag 2>/dev/null || true
             sleep 3
-          else
-            echo "Aucune release existante à supprimer"
           fi
 
       - name: Create release and upload asset
@@ -197,39 +86,15 @@ jobs:
           TOTAL="${{ steps.stats.outputs.total }}"
           RATED="${{ steps.stats.outputs.rated }}"
           SIZE="${{ steps.stats.outputs.size }}"
-
           gh release create fide-latest \
-            --title "FIDE Database — ${DATE}" \
-            --notes "## 🌍 Base de données FIDE — ${DATE}
-
-          | Champ | Valeur |
-          |---|---|
-          | 👥 Joueurs total | $(echo $TOTAL | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta') |
-          | 📊 Joueurs classés | $(echo $RATED | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta') |
-          | 📦 Taille compressée | ${SIZE} |
-          | 📅 Date | ${DATE} |
-
-          ### Installation
-          Le fichier est téléchargé automatiquement par Gestion Échecs.
-          Cliquez sur **Mode Mondial** puis **Télécharger la base FIDE**." \
+            --title "FIDE Database - ${DATE}" \
+            --notes "## Base FIDE ${DATE} | Joueurs: ${TOTAL} | Classes: ${RATED} | Taille: ${SIZE}" \
             --latest \
             "fide_players.db.gz"
 
-          echo "✅ Release créée avec succès !"
-          echo "URL: https://github.com/${{ github.repository }}/releases/download/fide-latest/fide_players.db.gz"
-
-      # ─────────────────────────────────────────────
-      # 7. Résumé dans le job
-      # ─────────────────────────────────────────────
       - name: Job summary
         run: |
-          echo "## 🌍 FIDE Database — ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Champ | Valeur |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| 👥 Joueurs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📊 Joueurs classés | ${{ steps.stats.outputs.rated }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📦 Taille compressée | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **Release créée :** \`fide-latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "🔗 **URL :** https://github.com/${{ github.repository }}/releases/download/fide-latest/fide_players.db.gz" >> $GITHUB_STEP_SUMMARY
+          echo "## FIDE Database - ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Joueurs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Joueurs classes | ${{ steps.stats.outputs.rated }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Taille compressee | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
