@@ -2,7 +2,7 @@ name: Update FIDE Database
 
 on:
   schedule:
-    - cron: '0 3 1 * *'
+    - cron: '23 6 2 * *'
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,22 @@ jobs:
           python-version: '3.11'
 
       - name: Build FIDE SQLite database
-        run: python3 scripts/process_fide.py
+        run: |
+          MAX_TRIES=5
+          for i in $(seq 1 $MAX_TRIES); do
+            if python3 scripts/process_fide.py; then
+              echo "OK - succes a la tentative $i/$MAX_TRIES"
+              exit 0
+            fi
+            echo "Echec tentative $i/$MAX_TRIES"
+            if [ "$i" -lt "$MAX_TRIES" ]; then
+              WAIT=$((i * 90))
+              echo "Nouvelle tentative dans ${WAIT}s (probable blocage/congestion reseau cote FIDE)..."
+              sleep "$WAIT"
+            fi
+          done
+          echo "ERREUR: echec apres $MAX_TRIES tentatives - le serveur FIDE ne repond pas depuis les runners GitHub"
+          exit 1
 
       - name: Validate database
         run: |
