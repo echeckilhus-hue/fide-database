@@ -1,0 +1,106 @@
+name: Build FIDE DB (reusable)
+
+# ✅ FIX [NET-IP-RANGE] (run #12, 2026-08-03) : le timeout persiste avec IPv4
+# forcé confirmé -> ce n'est pas un problème IPv6, mais un blocage réseau côté
+# FIDE ciblant probablement la plage d'IP des runners GitHub-hébergés. Un job
+# tourne sur une seule VM/IP du début à la fin : aucun retry interne (Python
+# ou bash) ne peut en changer. Cette logique est donc extraite en workflow
+# réutilisable, appelé par des JOBS séparés (= nouvelle VM = IP potentiellement
+# différente) depuis update-fide-db.yml.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Build FIDE SQLite database
+        run: python3 scripts/process_fide.py
+
+      - name: Validate database
+        run: |
+          python3 - <<'PYEOF'
+          import sqlite3, os, sys, datetime
+
+          DB = 'fide_players.db'
+          GZ = 'fide_players.db.gz'
+
+          if not os.path.exists(DB):
+              print(f"ERREUR: {DB} introuvable"); sys.exit(1)
+          if not os.path.exists(GZ):
+              print(f"ERREUR: {GZ} introuvable"); sys.exit(1)
+
+          conn = sqlite3.connect(DB)
+          total = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+          rated = conn.execute("SELECT COUNT(*) FROM players WHERE elo > 0").fetchone()[0]
+          conn.close()
+
+          size_gz = os.path.getsize(GZ)
+          print(f"  Joueurs total   : {total:,}")
+          print(f"  Joueurs classes : {rated:,}")
+          print(f"  Taille gz       : {size_gz / 1024 / 1024:.1f} MB")
+
+          if total < 500_000:
+              print(f"ERREUR: Base suspecte ({total} joueurs, attendu > 500 000)"); sys.exit(1)
+          if size_gz < 5_000_000:
+              print(f"ERREUR: Fichier gz trop petit ({size_gz} octets)"); sys.exit(1)
+
+          with open('fide_stats.txt', 'w') as f:
+              f.write(f"{total}\n{rated}\n{datetime.date.today().isoformat()}\n")
+          print("Validation reussie")
+          PYEOF
+
+      - name: Read stats
+        id: stats
+        run: |
+          TOTAL=$(sed -n '1p' fide_stats.txt)
+          RATED=$(sed -n '2p' fide_stats.txt)
+          DATE=$(sed -n '3p' fide_stats.txt)
+          SIZE=$(du -sh fide_players.db.gz | cut -f1)
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "rated=$RATED" >> $GITHUB_OUTPUT
+          echo "date=$DATE"   >> $GITHUB_OUTPUT
+          echo "size=$SIZE"   >> $GITHUB_OUTPUT
+
+      - name: Delete existing release (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_ID=$(gh release view fide-latest --json id -q '.id' 2>/dev/null || echo "")
+          if [ -n "$RELEASE_ID" ]; then
+            gh release delete fide-latest --yes --cleanup-tag 2>/dev/null || true
+            sleep 3
+          fi
+
+      - name: Create release and upload asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE="${{ steps.stats.outputs.date }}"
+          TOTAL="${{ steps.stats.outputs.total }}"
+          RATED="${{ steps.stats.outputs.rated }}"
+          SIZE="${{ steps.stats.outputs.size }}"
+          gh release create fide-latest \
+            --title "FIDE Database - ${DATE}" \
+            --notes "## Base FIDE ${DATE} | Joueurs: ${TOTAL} | Classes: ${RATED} | Taille: ${SIZE}" \
+            --latest \
+            "fide_players.db.gz"
+
+      - name: Job summary
+        run: |
+          echo "## FIDE Database - ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Joueurs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Joueurs classes | ${{ steps.stats.outputs.rated }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Taille compressee | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
