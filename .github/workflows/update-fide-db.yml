@@ -21,24 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Build FIDE SQLite database
-        run: |
-          # Le retry fin (5 tentatives, backoff) est gere directement dans
-          # download_fide_zip() cote Python. Ce niveau n'est qu'un filet de
-          # securite pour le reste du pipeline (parsing, DB, compression).
-          MAX_TRIES=2
-          for i in $(seq 1 $MAX_TRIES); do
-            if python3 scripts/process_fide.py; then
-              echo "OK - succes a la tentative $i/$MAX_TRIES"
-              exit 0
-            fi
-            echo "Echec tentative $i/$MAX_TRIES"
-            if [ "$i" -lt "$MAX_TRIES" ]; then
-              echo "Nouvelle tentative dans 60s..."
-              sleep 60
-            fi
-          done
-          echo "ERREUR: echec apres $MAX_TRIES tentatives completes du pipeline"
-          exit 1
+        run: python3 scripts/process_fide.py
 
       - name: Validate database
         run: |
