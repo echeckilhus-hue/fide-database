@@ -45,31 +45,61 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def download_fide_zip(url: str, dest: str) -> str:
-    """Télécharge un zip FIDE et retourne le nom du XML extrait."""
+def download_fide_zip(url: str, dest: str, max_tries: int = 5) -> str:
+    """Télécharge un zip FIDE et retourne le nom du XML extrait.
+
+    Réessaie avec un backoff croissant en cas de coupure réseau : le
+    serveur FIDE timeout parfois depuis les runners GitHub (congestion
+    côté FIDE au moment de la régénération mensuelle, ou filtrage des
+    IP datacenter - cause encore incertaine, le retry couvre les deux).
+    """
     import urllib.request
     import urllib.error
+    import time
 
-    log(f"📥 Téléchargement depuis {url}")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "TournamentManager/1.0"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            with open(dest + ".zip", "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        pct = downloaded / total * 100
-                        print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
-        print()
-    except urllib.error.URLError as e:
-        log(f"❌ Erreur téléchargement : {e}")
-        raise
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    }
+
+    last_error = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            log(f"📥 Téléchargement depuis {url} (tentative {attempt}/{max_tries})")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(dest + ".zip", "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded / total * 100
+                            print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
+            print()
+
+            if total and downloaded < total:
+                raise IOError(f"Téléchargement incomplet ({downloaded} / {total} octets)")
+
+            last_error = None
+            break
+
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_error = e
+            log(f"❌ Erreur téléchargement (tentative {attempt}/{max_tries}) : {e}")
+            if os.path.exists(dest + ".zip"):
+                os.remove(dest + ".zip")
+            if attempt < max_tries:
+                wait = min(30 * (2 ** (attempt - 1)), 300)
+                log(f"⏳ Nouvelle tentative dans {wait}s...")
+                time.sleep(wait)
+
+    if last_error is not None:
+        raise RuntimeError(f"Échec du téléchargement après {max_tries} tentatives : {last_error}") from last_error
 
     log("📦 Extraction du ZIP...")
     with zipfile.ZipFile(dest + ".zip", "r") as z:
