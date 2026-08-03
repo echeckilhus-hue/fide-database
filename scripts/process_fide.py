@@ -45,69 +45,31 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def download_fide_zip(url: str, dest: str, max_retries: int = 3) -> str:
-    """Télécharge un zip FIDE et retourne le nom du XML extrait.
-    Réessaie automatiquement en cas d'échec réseau (timeout, connexion, ...)."""
-    import socket
-    import time
-    import urllib.parse
+def download_fide_zip(url: str, dest: str) -> str:
+    """Télécharge un zip FIDE et retourne le nom du XML extrait."""
     import urllib.request
     import urllib.error
 
-    # ✅ FIX [NET-IPV4] (échec CI 2026-08-03, run #10 — timeout systématique au
-    # stade connect(), 2 tentatives) : sur les runners GitHub Actions hébergés,
-    # la résolution IPv6 de certains hôtes (dont ratings.fide.com) reste bloquée
-    # en silence par le réseau jusqu'au timeout — connect() ne renvoie aucune
-    # erreur rapide, contrairement à un vrai refus. L'hôte répond normalement en
-    # IPv4 (vérifié : le téléchargement passe hors runner GitHub). On force donc
-    # IPv4 pour tout le process avant de tenter la connexion.
-    _orig_getaddrinfo = socket.getaddrinfo
-    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-    socket.getaddrinfo = _ipv4_only_getaddrinfo
-
-    host = urllib.parse.urlparse(url).hostname
+    log(f"📥 Téléchargement depuis {url}")
     try:
-        ip = socket.gethostbyname(host)
-        log(f"🔎 {host} → {ip} (IPv4 forcé)")
-    except OSError as e:
-        log(f"⚠️  Résolution DNS impossible pour {host} : {e}")
-
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        suffix = f" (tentative {attempt}/{max_retries})" if attempt > 1 else ""
-        log(f"📥 Téléchargement depuis {url}{suffix}")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "TournamentManager/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                with open(dest + ".zip", "wb") as f:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = downloaded / total * 100
-                            print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
-            print()
-            last_err = None
-            break
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            last_err = e
-            log(f"❌ Erreur téléchargement (tentative {attempt}/{max_retries}) : {e}")
-            if os.path.exists(dest + ".zip"):
-                os.remove(dest + ".zip")
-            if attempt < max_retries:
-                wait = 20 * attempt
-                log(f"⏳ Nouvelle tentative dans {wait}s...")
-                time.sleep(wait)
-
-    if last_err is not None:
-        log(f"❌ Abandon après {max_retries} tentatives")
-        raise last_err
+        req = urllib.request.Request(url, headers={"User-Agent": "TournamentManager/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(dest + ".zip", "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded / total * 100
+                        print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
+        print()
+    except (urllib.error.URLError, TimeoutError) as e:
+        log(f"❌ Erreur téléchargement : {e}")
+        raise
 
     log("📦 Extraction du ZIP...")
     with zipfile.ZipFile(dest + ".zip", "r") as z:
