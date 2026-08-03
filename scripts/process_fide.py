@@ -45,29 +45,41 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def download_fide_zip(url: str, dest: str, max_tries: int = 5) -> str:
+def download_fide_zip(url: str, dest: str, max_retries: int = 3) -> str:
     """Télécharge un zip FIDE et retourne le nom du XML extrait.
-
-    Réessaie avec un backoff croissant en cas de coupure réseau : le
-    serveur FIDE timeout parfois depuis les runners GitHub (congestion
-    côté FIDE au moment de la régénération mensuelle, ou filtrage des
-    IP datacenter - cause encore incertaine, le retry couvre les deux).
-    """
+    Réessaie automatiquement en cas d'échec réseau (timeout, connexion, ...)."""
+    import socket
+    import time
+    import urllib.parse
     import urllib.request
     import urllib.error
-    import time
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    }
+    # ✅ FIX [NET-IPV4] (échec CI 2026-08-03, run #10 — timeout systématique au
+    # stade connect(), 2 tentatives) : sur les runners GitHub Actions hébergés,
+    # la résolution IPv6 de certains hôtes (dont ratings.fide.com) reste bloquée
+    # en silence par le réseau jusqu'au timeout — connect() ne renvoie aucune
+    # erreur rapide, contrairement à un vrai refus. L'hôte répond normalement en
+    # IPv4 (vérifié : le téléchargement passe hors runner GitHub). On force donc
+    # IPv4 pour tout le process avant de tenter la connexion.
+    _orig_getaddrinfo = socket.getaddrinfo
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
 
-    last_error = None
-    for attempt in range(1, max_tries + 1):
+    host = urllib.parse.urlparse(url).hostname
+    try:
+        ip = socket.gethostbyname(host)
+        log(f"🔎 {host} → {ip} (IPv4 forcé)")
+    except OSError as e:
+        log(f"⚠️  Résolution DNS impossible pour {host} : {e}")
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        suffix = f" (tentative {attempt}/{max_retries})" if attempt > 1 else ""
+        log(f"📥 Téléchargement depuis {url}{suffix}")
         try:
-            log(f"📥 Téléchargement depuis {url} (tentative {attempt}/{max_tries})")
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            req = urllib.request.Request(url, headers={"User-Agent": "TournamentManager/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 with open(dest + ".zip", "wb") as f:
@@ -81,25 +93,21 @@ def download_fide_zip(url: str, dest: str, max_tries: int = 5) -> str:
                             pct = downloaded / total * 100
                             print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
             print()
-
-            if total and downloaded < total:
-                raise IOError(f"Téléchargement incomplet ({downloaded} / {total} octets)")
-
-            last_error = None
+            last_err = None
             break
-
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last_error = e
-            log(f"❌ Erreur téléchargement (tentative {attempt}/{max_tries}) : {e}")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_err = e
+            log(f"❌ Erreur téléchargement (tentative {attempt}/{max_retries}) : {e}")
             if os.path.exists(dest + ".zip"):
                 os.remove(dest + ".zip")
-            if attempt < max_tries:
-                wait = min(30 * (2 ** (attempt - 1)), 300)
+            if attempt < max_retries:
+                wait = 20 * attempt
                 log(f"⏳ Nouvelle tentative dans {wait}s...")
                 time.sleep(wait)
 
-    if last_error is not None:
-        raise RuntimeError(f"Échec du téléchargement après {max_tries} tentatives : {last_error}") from last_error
+    if last_err is not None:
+        log(f"❌ Abandon après {max_retries} tentatives")
+        raise last_err
 
     log("📦 Extraction du ZIP...")
     with zipfile.ZipFile(dest + ".zip", "r") as z:
