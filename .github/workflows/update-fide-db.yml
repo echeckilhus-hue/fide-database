@@ -13,16 +13,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Python
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.11'
 
       - name: Build FIDE SQLite database
         run: |
-          MAX_TRIES=5
+          # Le retry fin (5 tentatives, backoff) est gere directement dans
+          # download_fide_zip() cote Python. Ce niveau n'est qu'un filet de
+          # securite pour le reste du pipeline (parsing, DB, compression).
+          MAX_TRIES=2
           for i in $(seq 1 $MAX_TRIES); do
             if python3 scripts/process_fide.py; then
               echo "OK - succes a la tentative $i/$MAX_TRIES"
@@ -30,12 +33,11 @@ jobs:
             fi
             echo "Echec tentative $i/$MAX_TRIES"
             if [ "$i" -lt "$MAX_TRIES" ]; then
-              WAIT=$((i * 90))
-              echo "Nouvelle tentative dans ${WAIT}s (probable blocage/congestion reseau cote FIDE)..."
-              sleep "$WAIT"
+              echo "Nouvelle tentative dans 60s..."
+              sleep 60
             fi
           done
-          echo "ERREUR: echec apres $MAX_TRIES tentatives - le serveur FIDE ne repond pas depuis les runners GitHub"
+          echo "ERREUR: echec apres $MAX_TRIES tentatives completes du pipeline"
           exit 1
 
       - name: Validate database
