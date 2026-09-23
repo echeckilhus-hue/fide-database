@@ -1,19 +1,24 @@
 name: Update FIDE Database
 
 # Blocage réseau côté FIDE (cf. FIX [NET-IP-RANGE]) : ratings.fide.com ne
-# répond pas depuis certaines IP des runners GitHub. Un job tourne sur une
-# seule VM/IP du début à la fin, donc un retry à l'intérieur du job ne sert à
-# rien — c'est pour ça qu'une relance MANUELLE (= nouvelle VM) finissait par
-# passer.
+# répond pas (timeout au connect()) depuis les runners GitHub, par PÉRIODES
+# de plusieurs heures (ex. 5 septembre : échec à 10h22, succès à 16h10 ;
+# 23 septembre : 5 VM différentes en échec d'affilée). Deux niveaux de retry :
 #
-# Ici chaque tentative ("build", matrice exécutée une à une) tourne sur une
-# NOUVELLE VM, comme une relance manuelle, mais automatiquement. Une tentative
-# en échec n'est pas bloquante (continue-on-error) : le run n'est rouge que si
-# TOUTES les tentatives ont échoué. La release n'est remplacée qu'une fois, par
-# le job "publish", avec une base déjà validée.
+# 1. Dans un run : chaque tentative ("build", matrice exécutée une à une)
+#    tourne sur une NOUVELLE VM (= autre IP). Une tentative en échec n'est pas
+#    bloquante (continue-on-error). La release n'est remplacée qu'une fois, par
+#    le job "publish", avec une base déjà validée.
+# 2. Dans le temps : le cron repasse toutes les 6 h du 2 au 7 du mois. Dès que
+#    la base du mois est publiée, les runs suivants s'arrêtent immédiatement.
+#    Un run planifié qui échoue reste vert (avertissement) tant qu'il reste un
+#    créneau ; il n'est rouge qu'au dernier créneau (le 7 à 18h UTC).
+#
+# Un lancement manuel (workflow_dispatch) force toujours la mise à jour et
+# est rouge si toutes ses tentatives échouent.
 on:
   schedule:
-    - cron: '23 6 2 * *'
+    - cron: '23 */6 2-7 * *'
   workflow_dispatch:
 
 # Un lancement manuel et le cron ne publient jamais en même temps.
@@ -24,7 +29,36 @@ concurrency:
 permissions: {}
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+    steps:
+      - name: Already published this month?
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then
+            echo "Lancement manuel : mise a jour forcee"
+            exit 0
+          fi
+          PUBLISHED=$(gh release view fide-latest --json publishedAt -q .publishedAt 2>/dev/null || echo "")
+          if [ "${PUBLISHED:0:7}" = "$(date -u +%Y-%m)" ]; then
+            echo "Base du mois deja publiee le ${PUBLISHED} - rien a faire"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Derniere publication : ${PUBLISHED:-aucune} - mise a jour necessaire"
+          fi
+
   build:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
     name: Tentative ${{ matrix.attempt }}/${{ strategy.job-total }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -36,7 +70,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        attempt: [1, 2, 3, 4, 5, 6, 7, 8]
+        attempt: [1, 2, 3, 4, 5]
     steps:
       - name: Previous attempt already succeeded?
         id: check
@@ -116,8 +150,8 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -134,14 +168,24 @@ jobs:
         with:
           name: fide-db
 
-      - name: Fail if every attempt failed
+      - name: Every attempt failed
         if: steps.download.outcome != 'success'
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          echo "::error::Toutes les tentatives ont echoue - le serveur FIDE ne repond pas depuis les runners GitHub (voir les jobs 'Tentative x/y'). La release precedente est conservee."
+          MSG="Toutes les tentatives ont echoue - le serveur FIDE ne repond pas depuis les runners GitHub (voir les jobs 'Tentative x/y'). La release precedente est conservee."
+          LAST_SLOT=false
+          if [ "$(date -u +%-d)" -ge 7 ] && [ "$(date -u +%-H)" -ge 18 ]; then LAST_SLOT=true; fi
+          if [ "$EVENT" = "schedule" ] && [ "$LAST_SLOT" = "false" ]; then
+            echo "::warning::${MSG} Nouvel essai automatique au prochain creneau (toutes les 6 h jusqu'au 7 du mois)."
+            exit 0
+          fi
+          echo "::error::${MSG}"
           exit 1
 
       - name: Read stats
         id: stats
+        if: steps.download.outcome == 'success'
         run: |
           {
             echo "total=$(sed -n '1p' fide_stats.txt)"
@@ -151,6 +195,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Replace release
+        if: steps.download.outcome == 'success'
         env:
           DATE: ${{ steps.stats.outputs.date }}
           TOTAL: ${{ steps.stats.outputs.total }}
@@ -177,11 +222,13 @@ jobs:
       # sans activité : sans commit régulier, le cron mensuel s'arrêterait tout
       # seul. Ré-activer le workflow via l'API remet ce compteur à zéro.
       - name: Keep the monthly schedule alive
+        if: ${{ !cancelled() }}
         run: |
           gh api -X PUT "repos/${GH_REPO}/actions/workflows/update-fide-db.yml/enable" \
             || echo "::warning::Impossible de reinitialiser le compteur d'inactivite du cron"
 
       - name: Job summary
+        if: steps.download.outcome == 'success'
         run: |
           {
             echo "## FIDE Database - ${{ steps.stats.outputs.date }}"
