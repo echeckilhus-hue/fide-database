@@ -1,44 +1,76 @@
 name: Update FIDE Database
 
+# Blocage réseau côté FIDE (cf. FIX [NET-IP-RANGE]) : ratings.fide.com ne
+# répond pas depuis certaines IP des runners GitHub. Un job tourne sur une
+# seule VM/IP du début à la fin, donc un retry à l'intérieur du job ne sert à
+# rien — c'est pour ça qu'une relance MANUELLE (= nouvelle VM) finissait par
+# passer.
+#
+# Ici chaque tentative ("build", matrice exécutée une à une) tourne sur une
+# NOUVELLE VM, comme une relance manuelle, mais automatiquement. Une tentative
+# en échec n'est pas bloquante (continue-on-error) : le run n'est rouge que si
+# TOUTES les tentatives ont échoué. La release n'est remplacée qu'une fois, par
+# le job "publish", avec une base déjà validée.
 on:
   schedule:
     - cron: '23 6 2 * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
+# Un lancement manuel et le cron ne publient jamais en même temps.
+concurrency:
+  group: update-fide-db
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
-  update-fide-db:
+  build:
+    name: Tentative ${{ matrix.attempt }}/${{ strategy.job-total }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Previous attempt already succeeded?
+        id: check
+        if: matrix.attempt > 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FOUND=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                    --jq '[.artifacts[] | select(.name == "fide-db")] | length' || echo 0)
+          if [ "${FOUND:-0}" -gt 0 ]; then
+            echo "Base deja construite par une tentative precedente - rien a faire"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait before retrying
+        if: steps.check.outputs.skip != 'true' && matrix.attempt > 1
+        run: sleep 60
+
       - name: Checkout
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v7.0.1
 
       - name: Setup Python
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.11'
 
       - name: Build FIDE SQLite database
-        run: |
-          MAX_TRIES=5
-          for i in $(seq 1 $MAX_TRIES); do
-            if python3 scripts/process_fide.py; then
-              echo "OK - succes a la tentative $i/$MAX_TRIES"
-              exit 0
-            fi
-            echo "Echec tentative $i/$MAX_TRIES"
-            if [ "$i" -lt "$MAX_TRIES" ]; then
-              WAIT=$((i * 90))
-              echo "Nouvelle tentative dans ${WAIT}s (probable blocage/congestion reseau cote FIDE)..."
-              sleep "$WAIT"
-            fi
-          done
-          echo "ERREUR: echec apres $MAX_TRIES tentatives - le serveur FIDE ne repond pas depuis les runners GitHub"
-          exit 1
+        if: steps.check.outputs.skip != 'true'
+        run: python3 scripts/process_fide.py
 
       - name: Validate database
+        if: steps.check.outputs.skip != 'true'
         run: |
           python3 - <<'PYEOF'
           import sqlite3, os, sys, datetime
@@ -67,49 +99,95 @@ jobs:
               print(f"ERREUR: Fichier gz trop petit ({size_gz} octets)"); sys.exit(1)
 
           with open('fide_stats.txt', 'w') as f:
-              f.write(f"{total}\n{rated}\n{datetime.date.today().isoformat()}\n")
+              f.write(f"{total}\n{rated}\n{datetime.date.today().isoformat()}\n{size_gz / 1024 / 1024:.1f} MB\n")
           print("Validation reussie")
           PYEOF
+
+      - name: Upload database
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fide-db
+          path: |
+            fide_players.db.gz
+            fide_stats.txt
+          if-no-files-found: error
+          compression-level: 0  # déjà compressé en gzip
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download database
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: fide-db
+
+      - name: Fail if every attempt failed
+        if: steps.download.outcome != 'success'
+        run: |
+          echo "::error::Toutes les tentatives ont echoue - le serveur FIDE ne repond pas depuis les runners GitHub (voir les jobs 'Tentative x/y'). La release precedente est conservee."
+          exit 1
 
       - name: Read stats
         id: stats
         run: |
-          TOTAL=$(sed -n '1p' fide_stats.txt)
-          RATED=$(sed -n '2p' fide_stats.txt)
-          DATE=$(sed -n '3p' fide_stats.txt)
-          SIZE=$(du -sh fide_players.db.gz | cut -f1)
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "rated=$RATED" >> $GITHUB_OUTPUT
-          echo "date=$DATE"   >> $GITHUB_OUTPUT
-          echo "size=$SIZE"   >> $GITHUB_OUTPUT
+          {
+            echo "total=$(sed -n '1p' fide_stats.txt)"
+            echo "rated=$(sed -n '2p' fide_stats.txt)"
+            echo "date=$(sed -n '3p' fide_stats.txt)"
+            echo "size=$(sed -n '4p' fide_stats.txt)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Delete existing release (if any)
+      - name: Replace release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATE: ${{ steps.stats.outputs.date }}
+          TOTAL: ${{ steps.stats.outputs.total }}
+          RATED: ${{ steps.stats.outputs.rated }}
+          SIZE: ${{ steps.stats.outputs.size }}
         run: |
-          RELEASE_ID=$(gh release view fide-latest --json id -q '.id' 2>/dev/null || echo "")
-          if [ -n "$RELEASE_ID" ]; then
-            gh release delete fide-latest --yes --cleanup-tag 2>/dev/null || true
+          TITLE="FIDE Database - ${DATE}"
+          NOTES="## Base FIDE ${DATE} | Joueurs: ${TOTAL} | Classes: ${RATED} | Taille: ${SIZE}"
+          if gh release view fide-latest >/dev/null 2>&1; then
+            gh release delete fide-latest --yes --cleanup-tag
             sleep 3
           fi
+          for i in 1 2 3; do
+            if gh release create fide-latest --target "$GITHUB_SHA" \
+                 --title "$TITLE" --notes "$NOTES" --latest fide_players.db.gz; then
+              exit 0
+            fi
+            echo "Creation de la release echouee (tentative $i/3)"
+            sleep 10
+          done
+          exit 1
 
-      - name: Create release and upload asset
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub désactive les workflows planifiés d'un dépôt public après 60 jours
+      # sans activité : sans commit régulier, le cron mensuel s'arrêterait tout
+      # seul. Ré-activer le workflow via l'API remet ce compteur à zéro.
+      - name: Keep the monthly schedule alive
         run: |
-          DATE="${{ steps.stats.outputs.date }}"
-          TOTAL="${{ steps.stats.outputs.total }}"
-          RATED="${{ steps.stats.outputs.rated }}"
-          SIZE="${{ steps.stats.outputs.size }}"
-          gh release create fide-latest \
-            --title "FIDE Database - ${DATE}" \
-            --notes "## Base FIDE ${DATE} | Joueurs: ${TOTAL} | Classes: ${RATED} | Taille: ${SIZE}" \
-            --latest \
-            "fide_players.db.gz"
+          gh api -X PUT "repos/${GH_REPO}/actions/workflows/update-fide-db.yml/enable" \
+            || echo "::warning::Impossible de reinitialiser le compteur d'inactivite du cron"
 
       - name: Job summary
         run: |
-          echo "## FIDE Database - ${{ steps.stats.outputs.date }}" >> $GITHUB_STEP_SUMMARY
-          echo "| Joueurs total | ${{ steps.stats.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Joueurs classes | ${{ steps.stats.outputs.rated }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Taille compressee | ${{ steps.stats.outputs.size }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## FIDE Database - ${{ steps.stats.outputs.date }}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Joueurs total | ${{ steps.stats.outputs.total }} |"
+            echo "| Joueurs classes | ${{ steps.stats.outputs.rated }} |"
+            echo "| Taille compressee | ${{ steps.stats.outputs.size }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
