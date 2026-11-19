@@ -19,6 +19,19 @@ Format FIDE XML :
     <blitz_rating>2886</blitz_rating>
     <birthday>1990</birthday>
   </player>
+
+✅ FIX FIDE-25 (19/11/2026) — LA BASE PUBLIÉE CONTENAIT LA LISTE DU 30/04/2024.
+Relevé le 19/11/2026 sur ratings.fide.com : « players_list_xml_foa.zip » n'est plus dans la page des listes
+(download_lists.phtml) et sa date est le 30/04/2024 (en-tête Last-Modified) ; chaque mois, ce script republiait donc
+la liste du 30/04/2024. La liste en cours est « players_list_xml.zip » (même XML : l'archive contient toujours
+« players_list_xml_foa.xml »). DÉSORMAIS :
+  • l'adresse est celle de la liste en cours ;
+  • la date de la liste (date du fichier dans l'archive de la FIDE) est contrôlée : plus de 45 jours = échec du
+    workflow (aucune base périmée publiée) ;
+  • la base porte une table « meta » (list_date, source_file, format, count, built_at) : le logiciel affiche la date
+    de la liste et refuse une base de secours non datée ou trop ancienne (electron-fide-handlers.js, FIX FIDE-25).
+Le logiciel importe d'ailleurs lui-même la liste officielle depuis la livraison 25 : cette base n'est plus qu'un secours.
+⚠️ HISTORIQUE (à conserver) : FIDE_DOWNLOAD_URL = "https://ratings.fide.com/download/players_list_xml_foa.zip"
 """
 
 import os
@@ -32,12 +45,11 @@ import datetime
 import xml.etree.ElementTree as ET
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-FIDE_DOWNLOAD_URL   = "https://ratings.fide.com/download/players_list_xml_foa.zip"
-FIDE_RAPID_URL      = "https://ratings.fide.com/download/players_list_xml_rapid_foa.zip"
-FIDE_BLITZ_URL      = "https://ratings.fide.com/download/players_list_xml_blitz_foa.zip"
+FIDE_DOWNLOAD_URL   = "https://ratings.fide.com/download/players_list_xml.zip"   # ✅ FIX FIDE-25
 OUTPUT_DB           = "fide_players.db"
 OUTPUT_GZ           = "fide_players.db.gz"
 BATCH_SIZE          = 5_000
+AGE_MAX_JOURS       = 45   # ✅ FIX FIDE-25 : une liste plus ancienne n'est pas publiée
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
@@ -45,8 +57,8 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def download_fide_zip(url: str, dest: str) -> str:
-    """Télécharge un zip FIDE et retourne le nom du XML extrait."""
+def download_fide_zip(url: str, dest: str):
+    """Télécharge un zip FIDE, extrait le XML dans dest ; retourne (dest, date de la liste AAAA-MM-JJ)."""
     import urllib.request
     import urllib.error
 
@@ -55,6 +67,7 @@ def download_fide_zip(url: str, dest: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": "TournamentManager/1.0"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             total = int(resp.headers.get("Content-Length", 0))
+            log(f"   Last-Modified : {resp.headers.get('Last-Modified', '?')}")
             downloaded = 0
             with open(dest + ".zip", "wb") as f:
                 while True:
@@ -67,23 +80,26 @@ def download_fide_zip(url: str, dest: str) -> str:
                         pct = downloaded / total * 100
                         print(f"\r  {downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({pct:.0f}%)", end="", flush=True)
         print()
+        if total and downloaded != total:
+            raise RuntimeError(f"Téléchargement incomplet : {downloaded} octets sur {total}")
     except (urllib.error.URLError, TimeoutError) as e:
         log(f"❌ Erreur téléchargement : {e}")
         raise
 
     log("📦 Extraction du ZIP...")
     with zipfile.ZipFile(dest + ".zip", "r") as z:
-        xml_names = [n for n in z.namelist() if n.lower().endswith(".xml")]
-        if not xml_names:
+        infos = [i for i in z.infolist() if i.filename.lower().endswith(".xml")]
+        if not infos:
             raise RuntimeError("Aucun fichier XML dans le ZIP FIDE")
-        xml_name = xml_names[0]
-        z.extract(xml_name, ".")
-        os.rename(xml_name, dest)
+        info = infos[0]
+        list_date = "%04d-%02d-%02d" % info.date_time[:3]   # ✅ FIX FIDE-25 : date de la liste
+        with z.open(info) as src, open(dest, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
 
     os.remove(dest + ".zip")
     size_mb = os.path.getsize(dest) / 1024 / 1024
-    log(f"✓ Extrait : {dest} ({size_mb:.1f} MB)")
-    return dest
+    log(f"✓ Extrait : {dest} ({size_mb:.1f} MB) — liste du {list_date}")
+    return dest, list_date
 
 
 def safe_int(val, default=0):
@@ -103,12 +119,19 @@ def parse_and_insert(xml_path: str, conn: sqlite3.Connection, rating_field: str 
     cur = conn.cursor()
     count = 0
     batch = []
+    first = True
 
     log(f"⚙️  Parsing {xml_path}...")
-    
+
     for event, elem in ET.iterparse(xml_path, events=("end",)):
         if elem.tag != "player":
             continue
+
+        # ✅ FIX FIDE-25 : la liste doit être la liste COMBINÉE (classique, rapide, blitz)
+        if first:
+            first = False
+            if elem.find(rapid_field) is None or elem.find(blitz_field) is None:
+                raise RuntimeError("Liste non combinée (Elo rapide ou blitz absents) : ce n'est pas players_list_xml.zip")
 
         fide_id = safe_int(elem.findtext("fideid"))
         name    = (elem.findtext("name") or "").strip()
@@ -150,12 +173,12 @@ def create_db(path: str) -> sqlite3.Connection:
     """Crée la base SQLite avec le schéma optimisé."""
     if os.path.exists(path):
         os.remove(path)
-    
+
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
-    
+
     conn.execute("""
         CREATE TABLE players (
             fide_id  INTEGER PRIMARY KEY,
@@ -169,6 +192,8 @@ def create_db(path: str) -> sqlite3.Connection:
             birth    TEXT
         )
     """)
+    # ✅ FIX FIDE-25 : date et provenance de la liste
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
     # Index full-text simplifié (compatible sans FTS5)
     conn.execute("CREATE INDEX idx_name ON players(name COLLATE NOCASE)")
     conn.execute("CREATE INDEX idx_fed  ON players(fed)")
@@ -183,7 +208,7 @@ def compress_db(db_path: str, gz_path: str) -> None:
     with open(db_path, "rb") as f_in:
         with gzip.open(gz_path, "wb", compresslevel=9) as f_out:
             shutil.copyfileobj(f_in, f_out)
-    
+
     size_in  = os.path.getsize(db_path)  / 1024 / 1024
     size_out = os.path.getsize(gz_path)  / 1024 / 1024
     ratio    = (1 - size_out / size_in) * 100
@@ -204,8 +229,14 @@ def main():
     log("🌍 === FIDE Database Builder ===")
     log(f"Date : {start.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 1. Télécharger le XML standard (contient elo, rapid, blitz)
-    download_fide_zip(FIDE_DOWNLOAD_URL, "fide_standard.xml")
+    # 1. Télécharger la liste COMBINÉE en cours (classique, rapide, blitz)
+    _, list_date = download_fide_zip(FIDE_DOWNLOAD_URL, "fide_standard.xml")
+
+    # ✅ FIX FIDE-25 : jamais de liste périmée publiée
+    age = (datetime.date.today() - datetime.date.fromisoformat(list_date)).days
+    log(f"📅 Liste FIDE du {list_date} ({age} jour(s))")
+    if age > AGE_MAX_JOURS:
+        raise RuntimeError(f"Liste FIDE du {list_date} : plus de {AGE_MAX_JOURS} jours — l'adresse {FIDE_DOWNLOAD_URL} ne donne plus la liste en cours")
 
     # 2. Créer la DB
     log("🗄️  Création de la base SQLite...")
@@ -218,8 +249,12 @@ def main():
         rapid_field="rapid_rating",
         blitz_field="blitz_rating"
     )
-    
+
     log(f"✓ {count:,} joueurs insérés")
+    conn.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [
+        ("list_date", list_date), ("source_file", "players_list_xml.zip"), ("format", "XML"),
+        ("count", str(count)), ("built_at", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))])
+    conn.commit()
 
     # 4. Statistiques par fédération (top 10)
     log("📊 Top 10 fédérations :")
@@ -243,6 +278,7 @@ def main():
     # 6. Optimisation SQLite (VACUUM pour compacter)
     log("⚙️  Optimisation (VACUUM)...")
     conn2 = sqlite3.connect(OUTPUT_DB)
+    conn2.execute("PRAGMA journal_mode=DELETE")
     conn2.execute("VACUUM")
     conn2.close()
 
@@ -254,7 +290,7 @@ def main():
     log(f"🔐 SHA-256: {sha[:16]}...{sha[-8:]}")
 
     # 9. Nettoyage
-    for f in ["fide_standard.xml", "fide_rapid.xml", "fide_blitz.xml"]:
+    for f in ["fide_standard.xml"]:
         if os.path.exists(f):
             os.remove(f)
 
@@ -265,11 +301,11 @@ def main():
     log(f"   📁 {OUTPUT_DB}  : {os.path.getsize(OUTPUT_DB)/1024/1024:.1f} MB")
     log(f"   📦 {OUTPUT_GZ} : {os.path.getsize(OUTPUT_GZ)/1024/1024:.1f} MB")
     log(f"   👥 Joueurs   : {total:,}")
-    log(f"   📅 Date      : {start.strftime('%Y-%m')}")
+    log(f"   📅 Liste FIDE du {list_date}")
 
     # Pour GitHub Actions summary
     summary = f"""
-## 🌍 FIDE Database — {start.strftime('%Y-%m')}
+## 🌍 FIDE Database — liste du {list_date}
 
 | | |
 |---|---|
